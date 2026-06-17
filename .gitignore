@@ -1,0 +1,19 @@
+# build artifact (single binary)
+/hopskip
+/web_overlay
+
+# local SQLite database + WAL/SHM sidecars
+*.db
+*.db-shm
+*.db-wal
+
+# audit body store (when the proxy lands)
+/audit/
+
+# fetch_url downloads
+/downloads/
+
+# misc
+.DS_Store
+
+.env.local

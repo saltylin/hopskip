@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Hopskip</title>
+  <link rel="icon" type="image/svg+xml" href="/hopskip_logo.svg" />
+  <link rel="stylesheet" href="/vendor/xterm/xterm.css" />
+  <link rel="stylesheet" href="/style.css" />
+  <!-- xterm is a UMD bundle: classic scripts (allowed by CSP script-src 'self'),
+       loaded before the module so window.Terminal / FitAddon are ready. -->
+  <script src="/vendor/xterm/xterm.js"></script>
+  <script src="/vendor/xterm/addon-fit.js"></script>
+  <!-- markdown-it (UMD) → window.markdownit; used to render assistant messages. -->
+  <script src="/vendor/markdown-it.min.js"></script>
+</head>
+<body>
+  <div id="app"></div>
+  <!-- Vue is imported by relative path from app.js (no inline import map, so the
+       strict CSP holds). The import-map alias arrives with the extension SDK. -->
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
