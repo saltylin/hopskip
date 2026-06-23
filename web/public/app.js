@@ -302,7 +302,7 @@ const ChatView = {
   emits: ['fleet-changed'],
   data() { return { chats: [], currentId: null, messages: [], input: '', connected: false,
                     status: { active: false, phase: '', start: 0, tokIn: 0, tokOut: 0 },
-                    now: 0, lastSummary: null } },
+                    now: 0, lastSummary: null, canJumpTop: false, canJumpBottom: false } },
   async mounted() {
     this.connect()
     await this.loadChats()
@@ -321,6 +321,7 @@ const ChatView = {
     // while they scroll up to read.
     const el = this.$refs.scroll
     if (el && el.scrollHeight - el.scrollTop - el.clientHeight < 120) el.scrollTop = el.scrollHeight
+    this.onScroll() // refresh the jump-button visibility as content changes
   },
   computed: {
     elapsedSec() { return this.status.active ? Math.max(0, (this.now - this.status.start) / 1000) : 0 },
@@ -421,7 +422,26 @@ const ChatView = {
       this.ws.send(JSON.stringify({ type: 'user_message', chat_id: this.currentId, text }))
       this.input = ''; this.open = null; this.beginTurn()
     },
+    // Ask the daemon to cancel the in-flight run. The agent loop cancels at the
+    // next provider call and emits a "⏹ Stopped." notice + done, which ends the
+    // turn here. endTurn locally too so the button flips back without waiting.
+    stop() {
+      if (this.ws && this.ws.readyState === 1) {
+        this.ws.send(JSON.stringify({ type: 'stop', chat_id: this.currentId }))
+      }
+      this.status.phase = 'thinking'
+    },
     onKey(e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); this.send() } },
+    // Jump-to-top/bottom: each button shows only when there's somewhere to go in
+    // that direction (a small threshold avoids flicker right at the edges).
+    onScroll() {
+      const el = this.$refs.scroll
+      if (!el) { this.canJumpTop = this.canJumpBottom = false; return }
+      this.canJumpTop = el.scrollTop > 200
+      this.canJumpBottom = el.scrollHeight - el.scrollTop - el.clientHeight > 200
+    },
+    scrollToTop() { const el = this.$refs.scroll; if (el) el.scrollTo({ top: 0, behavior: 'smooth' }) },
+    scrollToBottom() { const el = this.$refs.scroll; if (el) el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' }) },
   },
   template: `
     <div class="main">
@@ -442,7 +462,7 @@ const ChatView = {
           <div v-if="chats.length === 0" class="dim" style="padding:8px; font-size:12px">No saved chats yet.</div>
         </div>
         <div class="chat">
-          <div class="transcript" ref="scroll">
+          <div class="transcript" ref="scroll" @scroll="onScroll">
             <div v-if="messages.length === 0" class="empty">
               Ask Hopskip to investigate your fleet — e.g. <em>"check why my web server is down"</em>.<br>
               Chats are saved automatically; switch or delete them on the left.
@@ -461,9 +481,14 @@ const ChatView = {
               {{ lastSummary.sec.toFixed(1) }}s<span v-if="lastSummary.tok"> · {{ fmtNum(lastSummary.tok) }} tokens</span>
             </div>
           </div>
+          <div class="scroll-jumps">
+            <button v-if="canJumpTop" class="jump-btn" title="jump to top" @click="scrollToTop()">↑</button>
+            <button v-if="canJumpBottom" class="jump-btn" title="jump to bottom" @click="scrollToBottom()">↓</button>
+          </div>
           <div class="composer">
             <textarea v-model="input" rows="1" placeholder="Message Hopskip…  (Enter to send)" @keydown="onKey"></textarea>
-            <button class="btn" :disabled="!connected || !input.trim()" @click="send()">
+            <button v-if="status.active" class="btn stop" @click="stop()" title="stop the agent">⏹ Stop</button>
+            <button v-else class="btn" :disabled="!connected || !input.trim()" @click="send()">
               {{ connected ? 'Send' : 'Reconnecting…' }}
             </button>
           </div>

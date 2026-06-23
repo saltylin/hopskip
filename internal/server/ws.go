@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -134,9 +135,40 @@ func (s *Server) handleChatWS(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
+	// Agent runs go through a single worker goroutine so there is exactly one
+	// WebSocket writer at a time, while the read loop below stays free to receive
+	// a "stop". cancelCur cancels the in-flight run (the Stop button / a disconnect).
+	type job struct{ chatID, text string }
+	jobs := make(chan job, 8)
+	var mu sync.Mutex
+	var cancelCur context.CancelFunc
+	cancelNow := func() {
+		mu.Lock()
+		if cancelCur != nil {
+			cancelCur()
+		}
+		mu.Unlock()
+	}
+	go func() {
+		for j := range jobs {
+			ctx, cancel := context.WithCancel(context.Background())
+			mu.Lock()
+			cancelCur = cancel
+			mu.Unlock()
+			rec := &recorder{store: s.store, chatID: j.chatID, conn: conn}
+			s.agent.ChatFor(j.chatID).Send(ctx, j.text, rec.emit)
+			mu.Lock()
+			cancelCur = nil
+			mu.Unlock()
+			cancel()
+		}
+	}()
+	defer close(jobs) // ends the worker after the read loop returns
+
 	for {
 		_, data, err := conn.ReadMessage()
 		if err != nil {
+			cancelNow() // browser/socket gone — stop any in-flight run
 			return
 		}
 		var msg struct {
@@ -144,19 +176,23 @@ func (s *Server) handleChatWS(w http.ResponseWriter, r *http.Request) {
 			Text   string `json:"text"`
 			ChatID string `json:"chat_id"`
 		}
-		if json.Unmarshal(data, &msg) != nil || msg.Type != "user_message" || msg.ChatID == "" {
+		if json.Unmarshal(data, &msg) != nil {
 			continue
 		}
-
-		// Persist the user turn, then run the chat keyed by its id (so it keeps
-		// its in-memory context across reconnects). The recorder both streams to
-		// the browser and persists each transcript line.
-		_ = s.store.EnsureChat(msg.ChatID)
-		_ = s.store.AddChatMessage(msg.ChatID, "user", msg.Text)
-
-		rec := &recorder{store: s.store, chatID: msg.ChatID, conn: conn}
-		chat := s.agent.ChatFor(msg.ChatID)
-		chat.Send(context.Background(), msg.Text, rec.emit)
+		switch msg.Type {
+		case "stop":
+			cancelNow()
+		case "user_message":
+			if msg.ChatID == "" {
+				continue
+			}
+			// Persist the user turn, then queue the run keyed by its chat id (so it
+			// keeps its in-memory context across reconnects). The recorder streams to
+			// the browser and persists each transcript line.
+			_ = s.store.EnsureChat(msg.ChatID)
+			_ = s.store.AddChatMessage(msg.ChatID, "user", msg.Text)
+			jobs <- job{chatID: msg.ChatID, text: msg.Text}
+		}
 	}
 }
 

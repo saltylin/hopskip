@@ -114,6 +114,7 @@ body {
 .btn.ghost { background: transparent; border: 1px solid var(--border); color: var(--fg); font-weight: 500; }
 .btn.ghost:hover { background: var(--bg-elev); }
 .btn.sm { padding: 3px 8px; font-size: 12px; margin-left: 6px; }
+.btn.stop { background: var(--danger); color: #1a0c0c; }
 .modelin {
   font-family: var(--mono); color: var(--accent); font-size: 13px;
   background: var(--bg-elev); border: 1px solid var(--border); border-radius: 5px;
@@ -193,7 +194,16 @@ body {
 .host-meta { font-family: var(--mono); font-size: 12px; color: var(--fg-dim); }
 
 /* ---- chat ---- */
-.chat { display: flex; flex-direction: column; flex: 1; min-height: 0; min-width: 0; }
+.chat { display: flex; flex-direction: column; flex: 1; min-height: 0; min-width: 0; position: relative; }
+/* floating jump-to-top/bottom buttons over the transcript, above the composer */
+.scroll-jumps { position: absolute; right: 18px; bottom: 78px; display: flex; flex-direction: column; gap: 6px; z-index: 5; }
+.jump-btn {
+  width: 32px; height: 32px; border-radius: 50%; cursor: pointer;
+  background: var(--bg-elev); color: var(--fg); border: 1px solid var(--border);
+  font-size: 15px; line-height: 1; display: flex; align-items: center; justify-content: center;
+  box-shadow: 0 2px 8px rgba(0,0,0,.35);
+}
+.jump-btn:hover { border-color: var(--accent); color: var(--accent); }
 .chat-layout { flex: 1; display: flex; min-height: 0; }
 .chat-list {
   width: 212px; flex: 0 0 212px; border-right: 1px solid var(--border);

@@ -11,6 +11,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"io/fs"
 	"net/http"
 	"net/url"
@@ -62,6 +63,13 @@ type Event struct {
 	Text string `json:"text,omitempty"`
 	In   int    `json:"in,omitempty"`  // input/prompt tokens (usage events only)
 	Out  int    `json:"out,omitempty"` // output/completion tokens (usage events only)
+}
+
+// stoppedByOperator reports whether the run's context was cancelled by the
+// operator hitting Stop (context.Canceled), as opposed to a per-call timeout
+// (DeadlineExceeded, which lives on the child context only).
+func stoppedByOperator(ctx context.Context) bool {
+	return errors.Is(ctx.Err(), context.Canceled)
 }
 
 // friendlyErr turns a raw provider error into operator-facing text, adding

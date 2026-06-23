@@ -84,6 +84,11 @@ func (r *anthropicRunner) run(ctx context.Context, userMessage string, emit func
 		err := stream.Err()
 		cancel()
 		if err != nil {
+			if stoppedByOperator(ctx) {
+				emit(Event{Kind: "notice", Text: "⏹ Stopped."})
+				emit(Event{Kind: "done"})
+				return
+			}
 			emit(Event{Kind: "error", Text: friendlyErr(err)})
 			emit(Event{Kind: "done"})
 			return

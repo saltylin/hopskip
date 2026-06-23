@@ -142,6 +142,11 @@ func (r *openaiRunner) run(ctx context.Context, userMessage string, emit func(Ev
 				r.runResponses(ctx, userMessage, emit)
 				return
 			}
+			if stoppedByOperator(ctx) {
+				emit(Event{Kind: "notice", Text: "⏹ Stopped."})
+				emit(Event{Kind: "done"})
+				return
+			}
 			emit(Event{Kind: "error", Text: friendlyErr(err)})
 			emit(Event{Kind: "done"})
 			return
@@ -208,6 +213,11 @@ func (r *openaiRunner) runResponses(ctx context.Context, userMessage string, emi
 		resp, err := r.client.Responses.New(cctx, params, option.WithMaxRetries(r.agent.MaxRetries()))
 		cancel()
 		if err != nil {
+			if stoppedByOperator(ctx) {
+				emit(Event{Kind: "notice", Text: "⏹ Stopped."})
+				emit(Event{Kind: "done"})
+				return
+			}
 			emit(Event{Kind: "error", Text: friendlyErr(err)})
 			emit(Event{Kind: "done"})
 			return
