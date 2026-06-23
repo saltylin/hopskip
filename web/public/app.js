@@ -309,7 +309,12 @@ const ChatView = {
     if (this.chats.length) await this.selectChat(this.chats[0])
     else await this.newChat()
   },
-  beforeUnmount() { if (this.ws) { this.ws.onclose = null; this.ws.close() } this.stopTicker() },
+  beforeUnmount() {
+    this._closing = true
+    clearTimeout(this._reconnectT)
+    if (this.ws) { this.ws.onclose = null; this.ws.close() }
+    this.stopTicker()
+  },
   updated() {
     // Stick to the bottom only when the user is already near it, so the live
     // "thinking…" timer (which re-renders every tick) doesn't yank them down
@@ -326,9 +331,19 @@ const ChatView = {
     connect() {
       const ws = new WebSocket(wsBase + '/ws/chat')
       this.ws = ws
-      ws.onopen = () => { this.connected = true }
-      ws.onclose = () => { this.connected = false }
-      ws.onmessage = (ev) => this.onEvent(JSON.parse(ev.data))
+      ws.onopen = () => { this.connected = true; this._reconnectDelay = 500 }
+      // Auto-reconnect: a dropped socket (idle/NAT/proxy/laptop sleep) otherwise
+      // leaves Send greyed out until a manual refresh. Back off 0.5s→8s.
+      ws.onclose = () => { this.connected = false; this.scheduleReconnect() }
+      ws.onerror = () => { try { ws.close() } catch (e) {} } // -> onclose -> reconnect
+      ws.onmessage = (ev) => { try { this.onEvent(JSON.parse(ev.data)) } catch (e) {} }
+    },
+    scheduleReconnect() {
+      if (this._closing) return // intentional close on unmount
+      const delay = this._reconnectDelay || 500
+      this._reconnectDelay = Math.min(delay * 2, 8000)
+      clearTimeout(this._reconnectT)
+      this._reconnectT = setTimeout(() => { if (!this._closing) this.connect() }, delay)
     },
     async loadChats() { this.chats = (await api('GET', '/api/chats')).chats || [] },
     async newChat() {
@@ -448,7 +463,9 @@ const ChatView = {
           </div>
           <div class="composer">
             <textarea v-model="input" rows="1" placeholder="Message Hopskip…  (Enter to send)" @keydown="onKey"></textarea>
-            <button class="btn" :disabled="!connected || !input.trim()" @click="send()">Send</button>
+            <button class="btn" :disabled="!connected || !input.trim()" @click="send()">
+              {{ connected ? 'Send' : 'Reconnecting…' }}
+            </button>
           </div>
         </div>
       </div>

@@ -114,6 +114,26 @@ func (s *Server) handleChatWS(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
+	// Keepalive: ping the browser periodically so an idle chat connection isn't
+	// dropped by the browser/OS/intermediaries (which would grey out Send until a
+	// refresh). WriteControl is safe concurrently with the recorder's writes.
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		t := time.NewTicker(30 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)); err != nil {
+					return
+				}
+			}
+		}
+	}()
+
 	for {
 		_, data, err := conn.ReadMessage()
 		if err != nil {
