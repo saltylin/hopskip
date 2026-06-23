@@ -164,7 +164,7 @@ func (r *openaiRunner) run(ctx context.Context, userMessage string, emit func(Ev
 		for _, tc := range choice.Message.ToolCalls {
 			emit(Event{Kind: "tool_use", Text: tc.Function.Name + "  " + tc.Function.Arguments})
 			out, _ := r.disp.Dispatch(tc.Function.Name, json.RawMessage(tc.Function.Arguments))
-			emit(Event{Kind: "tool_result", Text: clip(out, 1400)})
+			emit(Event{Kind: "tool_result", Text: clip(out, toolResultDisplayLimit)})
 			r.msgs = append(r.msgs, openai.ToolMessage(out, tc.ID))
 		}
 	}
@@ -236,7 +236,7 @@ func (r *openaiRunner) runResponses(ctx context.Context, userMessage string, emi
 		for _, tc := range calls {
 			emit(Event{Kind: "tool_use", Text: tc.Name + "  " + tc.Arguments})
 			out, _ := r.disp.Dispatch(tc.Name, json.RawMessage(tc.Arguments))
-			emit(Event{Kind: "tool_result", Text: clip(out, 1400)})
+			emit(Event{Kind: "tool_result", Text: clip(out, toolResultDisplayLimit)})
 			input = append(input, responses.ResponseInputItemParamOfFunctionCallOutput(tc.CallID, out))
 		}
 	}

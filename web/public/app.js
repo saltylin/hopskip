@@ -28,6 +28,78 @@ function renderMd(text) {
   return escapeHtml(text || '').replace(/\n/g, '<br>')
 }
 
+// Tool calls and results are JSON strings — shown raw they print literal "\n" and
+// "<". Parsing turns those back into real newlines and characters; we then
+// lay the fields out as readable "key: value" lines (multi-line values like a
+// captured screen flow onto their own lines). The bubble is white-space:pre-wrap,
+// so the newlines render. Anything that isn't JSON is shown unchanged.
+// Tidy a multi-line value for display: right-trim each line, drop leading/trailing
+// blank lines (a captured screen is padded to the pane height), and collapse runs
+// of blank lines. Also cleans up already-stored results from older chats.
+function tidyMultiline(v) {
+  let lines = v.split('\n').map((l) => l.replace(/[ \t]+$/, ''))
+  while (lines.length && lines[0] === '') lines.shift()
+  while (lines.length && lines[lines.length - 1] === '') lines.pop()
+  const out = []; let blank = 0
+  for (const l of lines) { if (l === '') { if (++blank > 1) continue } else blank = 0; out.push(l) }
+  return out.join('\n')
+}
+function prettyKV(obj) {
+  return Object.entries(obj).map(([k, v]) => {
+    if (typeof v === 'string') return v.includes('\n') ? k + ':\n' + tidyMultiline(v) : k + ': ' + v
+    return k + ': ' + JSON.stringify(v)
+  }).join('\n')
+}
+// Turn JSON string escapes (\n, \t, \uXXXX, \", \\) back into real characters.
+// Used as a fallback when a result can't be parsed (e.g. it was truncated for
+// display, cutting the JSON mid-string) so it's still readable, not literal "\n".
+function jsonUnescape(s) {
+  let out = ''
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] !== '\\' || i + 1 >= s.length) { out += s[i]; continue }
+    const c = s[++i]
+    if (c === 'n') out += '\n'
+    else if (c === 't') out += '\t'
+    else if (c === 'r') out += ''
+    else if (c === 'u') { out += String.fromCharCode(parseInt(s.substr(i + 1, 4), 16) || 0); i += 4 }
+    else out += c // \" \\ \/ → the literal char
+  }
+  return out
+}
+// Parse JSON, tolerating a value that was truncated mid-string for display: try
+// the text as-is, then a few repairs that close an unterminated string/object.
+function looseParseObject(text) {
+  const t = (text || '').trim()
+  if (!t.startsWith('{')) return null
+  const tries = [t, t + '"}', t + '}', t + '"}}', t + '}}']
+  const comma = t.lastIndexOf(',')
+  if (comma > 0) tries.push(t.slice(0, comma) + '}')
+  for (const c of tries) {
+    try { const v = JSON.parse(c); if (v && typeof v === 'object' && !Array.isArray(v)) return v } catch (e) {}
+  }
+  return null
+}
+function formatToolResult(text) {
+  const obj = looseParseObject(text)
+  if (obj) return prettyKV(obj)
+  try {
+    const v = JSON.parse(text)
+    return typeof v === 'string' ? v : JSON.stringify(v, null, 2)
+  } catch (e) {}
+  return jsonUnescape(text) // not parseable even loosely — at least unescape it
+}
+// A tool_use line is "name  {args-json}"; pretty-print the args, keep the name.
+function formatToolUse(text) {
+  const i = text.indexOf('  ')
+  if (i > 0) {
+    const name = text.slice(0, i), rest = text.slice(i + 2)
+    const a = looseParseObject(rest)
+    if (a) return Object.keys(a).length ? name + '\n' + prettyKV(a) : name
+    return name + '\n' + jsonUnescape(rest)
+  }
+  return text
+}
+
 // cloud provider is a schema-less `provider` tag; give each value a stable color.
 function providerOf(h) { return (h && h.tags && h.tags.provider) || '' }
 const PROVIDER_COLORS = ['#4f9cf9', '#6ee7b7', '#f0a868', '#c084fc', '#f472b6', '#38bdf8', '#fbbf24', '#34d399']
@@ -267,8 +339,12 @@ const ChatView = {
     async selectChat(c) {
       this.currentId = c.id
       const d = await api('GET', '/api/chats/' + c.id + '/messages')
-      this.messages = (d.messages || []).map((m) =>
-        m.role === 'assistant' ? { role: m.role, text: m.text, html: renderMd(m.text) } : { role: m.role, text: m.text })
+      this.messages = (d.messages || []).map((m) => {
+        if (m.role === 'assistant') return { role: m.role, text: m.text, html: renderMd(m.text) }
+        if (m.role === 'tool') return { role: m.role, text: m.text, disp: formatToolUse(m.text) }
+        if (m.role === 'tool-result') return { role: m.role, text: m.text, disp: formatToolResult(m.text) }
+        return { role: m.role, text: m.text }
+      })
     },
     async deleteChat(c) {
       if (!confirm('Delete this chat?')) return
@@ -308,9 +384,11 @@ const ChatView = {
       } else if (e.kind === 'usage') {
         this.status.tokIn += e.in || 0; this.status.tokOut += e.out || 0
       } else if (e.kind === 'tool_use') {
-        this.open = null; this.status.phase = 'thinking'; this.messages.push({ role: 'tool', text: e.text || '' })
+        this.open = null; this.status.phase = 'thinking'
+        this.messages.push({ role: 'tool', text: e.text || '', disp: formatToolUse(e.text || '') })
       } else if (e.kind === 'tool_result') {
-        this.status.phase = 'thinking'; this.messages.push({ role: 'tool-result', text: e.text || '' })
+        this.status.phase = 'thinking'
+        this.messages.push({ role: 'tool-result', text: e.text || '', disp: formatToolResult(e.text || '') })
       } else if (e.kind === 'notice') {
         this.open = null; this.messages.push({ role: 'notice', text: e.text || '' })
       } else if (e.kind === 'error') {
@@ -357,7 +435,7 @@ const ChatView = {
             <div v-for="(m, i) in messages" :key="i" class="msg" :class="m.role">
               <div class="who" v-if="m.role !== 'user'">{{ m.role }}</div>
               <div v-if="m.role === 'assistant'" class="bubble md" v-html="m.html"></div>
-              <div v-else class="bubble">{{ m.text }}</div>
+              <div v-else class="bubble">{{ m.disp || m.text }}</div>
             </div>
             <div v-if="status.active" class="status-line">
               <span class="dot-pulse"></span>
@@ -1213,3 +1291,4 @@ app.mount('#app')
 // Exposed for tests and future extension tooling; unused by the browser shell.
 export { App, TermView, ChatView, TopoView, HostDetailView, SettingsView, ChangesView }
 export { ExtensionSlot, ExtErrors, extRegistry, loadExtensions, extError, lineDiff }
+export { formatToolUse, formatToolResult, prettyKV }

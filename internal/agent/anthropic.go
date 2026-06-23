@@ -104,7 +104,7 @@ func (r *anthropicRunner) run(ctx context.Context, userMessage string, emit func
 			}
 			emit(Event{Kind: "tool_use", Text: tu.Name + "  " + string(tu.Input)})
 			out, isErr := r.disp.Dispatch(tu.Name, tu.Input)
-			emit(Event{Kind: "tool_result", Text: clip(out, 1400)})
+			emit(Event{Kind: "tool_result", Text: clip(out, toolResultDisplayLimit)})
 			results = append(results, anthropic.NewToolResultBlock(tu.ID, out, isErr))
 		}
 		r.msgs = append(r.msgs, anthropic.NewUserMessage(results...))

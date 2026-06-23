@@ -184,7 +184,41 @@ func (m *Manager) Capture(id string, lines int) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("capture-pane: %w", err)
 	}
-	return string(out), nil
+	return normalizeScreen(string(out)), nil
+}
+
+// normalizeScreen tidies a captured pane for tool results: right-trims each line,
+// drops leading/trailing blank lines (tmux pads the capture to the full pane
+// height, producing the long run of empty lines at the bottom), and collapses any
+// internal run of 2+ blank lines to one. This is display-and-model hygiene only —
+// the live terminal stream uses a separate PTY path and is untouched. (CLAUDE.md
+// MCP spec §6.5: screen normalization SHOULD.)
+func normalizeScreen(s string) string {
+	lines := strings.Split(s, "\n")
+	for i := range lines {
+		lines[i] = strings.TrimRight(lines[i], " \t")
+	}
+	start := 0
+	for start < len(lines) && lines[start] == "" {
+		start++
+	}
+	end := len(lines)
+	for end > start && lines[end-1] == "" {
+		end--
+	}
+	out := make([]string, 0, end-start)
+	blank := 0
+	for _, l := range lines[start:end] {
+		if l == "" {
+			if blank++; blank > 1 {
+				continue
+			}
+		} else {
+			blank = 0
+		}
+		out = append(out, l)
+	}
+	return strings.Join(out, "\n")
 }
 
 // sendText types text into a pane, translating '\n' into Enter keypresses.

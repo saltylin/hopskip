@@ -701,11 +701,16 @@ func (d *Dispatcher) resolve(ref string) (store.Host, error) {
 }
 
 func jsonStr(v any) string {
-	b, err := json.Marshal(v)
-	if err != nil {
+	// Don't HTML-escape: tool results carry shell output full of <, >, & — escaping
+	// them to </>/& hurts both the transcript display and what the
+	// model reads back. A JSON Encoder with SetEscapeHTML(false) emits them literally.
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
 		return `{"error":"marshal failed"}`
 	}
-	return string(b)
+	return strings.TrimRight(buf.String(), "\n") // Encode appends a trailing newline
 }
 
 func errStr(err error) string { return jsonStr(map[string]any{"error": err.Error()}) }
@@ -731,11 +736,21 @@ func isDigits(s string) bool {
 	return true
 }
 
+// toolResultDisplayLimit caps the tool-result text streamed to / persisted for
+// the browser (the model always gets the full result). Generous enough to hold a
+// full terminal screen so results rarely truncate; the frontend tolerates a
+// truncated tail anyway (loose JSON parse + unescape).
+const toolResultDisplayLimit = 6000
+
 func clip(s string, n int) string {
-	if len(s) > n {
-		return s[:n] + "…"
+	if len(s) <= n {
+		return s
 	}
-	return s
+	// Trim back to a rune boundary so we never split a multibyte UTF-8 char.
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n] + "…"
 }
 
 // fetchURL downloads a URL through the operator's (proxy-aware) HTTP client and

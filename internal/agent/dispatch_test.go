@@ -11,6 +11,28 @@ import (
 	"github.com/saltylin/hopskip/internal/store"
 )
 
+func TestJSONStrNoHTMLEscape(t *testing.T) {
+	// Tool results carry shell output with <, >, & — these must appear literally,
+	// not as < / > / &, both for the transcript and the model.
+	out := jsonStr(map[string]any{"screen": "<html> a & b", "exit_code": 0})
+	// If jsonStr HTML-escaped, "<", ">", "&" would become < etc. and this
+	// literal substring would NOT survive. Its presence proves no escaping.
+	if !strings.Contains(out, "<html> a & b") {
+		t.Fatalf("expected literal <, >, & (no HTML escaping); got: %s", out)
+	}
+	if strings.Contains(out, "u003c") || strings.Contains(out, "u0026") {
+		t.Fatalf("found a unicode escape — HTML escaping not disabled: %s", out)
+	}
+	// still valid JSON that round-trips
+	var v map[string]any
+	if err := json.Unmarshal([]byte(out), &v); err != nil {
+		t.Fatalf("jsonStr output not valid JSON: %v (%s)", err, out)
+	}
+	if v["screen"] != "<html> a & b" {
+		t.Fatalf("round-trip mismatch: %v", v["screen"])
+	}
+}
+
 func TestFetchURLAndKnowledge(t *testing.T) {
 	dlDir := t.TempDir()
 	t.Setenv("HOPSKIP_DOWNLOAD_DIR", dlDir)
