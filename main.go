@@ -1,6 +1,6 @@
 // Command hopskip is the single-binary daemon: it serves the embedded Vue shell,
 // the inventory + session REST API, and the terminal/chat WebSockets; it owns
-// the tmux sessions and the SQLite store. See CLAUDE.md.
+// the PTY sessions and the SQLite store. See CLAUDE.md.
 package main
 
 import (
@@ -16,7 +16,7 @@ import (
 )
 
 // env reads a bootstrap-only setting. ONLY config that cannot live in the DB
-// belongs here — the listen address, the SQLite path, the tmux binary, and the
+// belongs here — the listen address, the SQLite path, and the
 // optional dev web overlay. Everything operator-tunable (the network proxy,
 // step/retry budgets, provider tokens) is set in the Settings UI and stored in
 // SQLite; there is no env fallback for those.
@@ -32,10 +32,9 @@ func main() {
 	log.SetPrefix("hopskip: ")
 
 	var (
-		addr    = env("HOPSKIP_ADDR", "127.0.0.1:8765")
-		dbPath  = env("HOPSKIP_DB_PATH", "hopskip.db")
-		tmuxBin = env("HOPSKIP_TMUX_BIN", "tmux")
-		webDir  = os.Getenv("HOPSKIP_WEB_DIR") // optional dev overlay; empty = embed-only
+		addr   = env("HOPSKIP_ADDR", "127.0.0.1:8765")
+		dbPath = env("HOPSKIP_DB_PATH", "hopskip.db")
+		webDir = os.Getenv("HOPSKIP_WEB_DIR") // optional dev overlay; empty = embed-only
 	)
 
 	st, err := store.Open(dbPath)
@@ -44,13 +43,13 @@ func main() {
 	}
 	defer st.Close()
 
-	mgr := session.NewManager(tmuxBin, st)
+	mgr := session.NewManager(st)
 	if err := mgr.Available(); err != nil {
-		log.Fatalf("%v\n  install tmux (brew install tmux) or set HOPSKIP_TMUX_BIN", err)
+		log.Fatalf("%v\n  set $SHELL to a usable shell", err)
 	}
-	// Reconcile DB sessions against live tmux: mark vanished panes closed.
-	live := mgr.LiveTmuxNames()
-	if err := st.MarkStaleSessionsClosed(func(name string) bool { return live[name] }); err != nil {
+	// PTYs don't survive a daemon restart, so the live map starts empty — mark any
+	// sessions still 'open' in the DB as closed.
+	if err := mgr.CloseAllInDB(); err != nil {
 		log.Printf("reconcile sessions: %v", err)
 	}
 
@@ -59,7 +58,7 @@ func main() {
 	ag := agent.New(mgr, st, web.FS())
 	srv := server.New(st, mgr, ag, web.FS(), webDir)
 
-	log.Printf("db=%s tmux=%s web_dir=%q agent_configured=%v", dbPath, tmuxBin, webDir, ag.Configured())
+	log.Printf("db=%s shell=%s web_dir=%q agent_configured=%v", dbPath, os.Getenv("SHELL"), webDir, ag.Configured())
 	log.Printf("listening on http://%s", addr)
 	if err := http.ListenAndServe(addr, srv.Handler()); err != nil {
 		log.Fatal(err)

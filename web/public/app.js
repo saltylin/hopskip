@@ -136,7 +136,7 @@ const termTheme = {
   black: '#0e1116', brightBlack: '#5b6677',
 }
 
-// ---- Terminal view: a real browser terminal attached to a tmux session ----
+// ---- Terminal view: a real browser terminal attached to a session's PTY ----
 //
 // Connection-state model fixes the "ssh button still fires after you're already
 // logged in" bug: once we've typed `ssh <target>` (manually or auto on open),
@@ -168,6 +168,9 @@ const TermView = {
     const term = new window.Terminal({
       fontFamily: 'ui-monospace, Menlo, Consolas, monospace',
       fontSize: 13, cursorBlink: true, cursorStyle: 'bar', theme: termTheme, scrollback: this.scrollback,
+      // double-click word selection: treat only these as separators, so paths,
+      // URLs, IPs and user@host:port select as one word (keeps / : . @ - _ ~ =).
+      wordSeparator: '\t ()[]{}\'",;|&<>',
     })
     const fit = new window.FitAddon.FitAddon()
     term.loadAddon(fit)
@@ -203,26 +206,15 @@ const TermView = {
       if (ws.readyState === 1) ws.send(new TextEncoder().encode(d))
     })
 
-    // Selection is tmux's (mouse on), copied on drag-end and delivered to the
-    // browser via OSC 52 — honor it so a drag puts the text on the system
-    // clipboard. (onSelectionChange still covers an xterm-local Shift-drag.)
+    // The terminal attaches to a direct PTY, so xterm.js owns selection and
+    // scrollback natively (like a local terminal): drag-select, double-click word
+    // select across / : ., wheel scrollback, selection survives scrolling. We add
+    // only clipboard wiring — auto-copy the selection, and ⌘C / Ctrl+Shift+C copy,
+    // ⌘V / Ctrl+Shift+V paste. Plain Ctrl+C stays a SIGINT.
     term.onSelectionChange(() => {
       const sel = term.getSelection()
       if (sel && navigator.clipboard) navigator.clipboard.writeText(sel).catch(() => {})
     })
-    if (term.parser && term.parser.registerOscHandler) {
-      term.parser.registerOscHandler(52, (data) => {
-        // data is "<Pc>;<base64>" (e.g. "c;SGVsbG8=")
-        const semi = String(data).indexOf(';')
-        if (semi >= 0 && navigator.clipboard) {
-          try {
-            const text = atob(String(data).slice(semi + 1))
-            if (text) navigator.clipboard.writeText(text).catch(() => {})
-          } catch (e) {}
-        }
-        return true
-      })
-    }
     term.attachCustomKeyEventHandler((e) => {
       if (e.type !== 'keydown') return true
       const isC = e.key === 'c' || e.key === 'C'

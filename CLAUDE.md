@@ -54,7 +54,7 @@ not because a schema field declares it.
 | Layer            | Technology                                      |
 |------------------|-------------------------------------------------|
 | Daemon / backend | Go                                              |
-| Terminal backend | tmux (one pane per session), driven via `tmux` CLI or `libtmux`-equivalent |
+| Terminal backend | **Daemon-owned PTYs** — one shell per session on a `creack/pty` master; the browser's xterm.js attaches directly so it owns native selection + scrollback. A server-side VT emulator (`hinshun/vt10x`) mirrors each PTY for the agent's `read_screen`. *(Amended from the original tmux backend — the operator chose direct PTYs to get true local-terminal selection/scroll; tmux's pane rendering is incompatible with xterm.js owning the mouse/scrollback. Sessions no longer survive a daemon restart.)* |
 | Storage          | SQLite (single local file)                      |
 | Frontend         | Vue (SPA)                                        |
 | Asset delivery   | Go `embed.FS` base shell (single binary), overlaid by a **SQLite-backed** authored overlay (`web_files`), with an optional disk overlay (`HOPSKIP_WEB_DIR`) for dev. Resolution: disk → DB → embed (see `spec/frontend-extension-protocol.md`) |
@@ -63,9 +63,10 @@ not because a schema field declares it.
 | Browser ↔ daemon | WebSocket (bidirectional; daemon pushes tokens/tool-calls, browser pushes chat + future approvals) |
 
 The deliverable is a **single Go binary**: it embeds the Vue frontend via
-`embed.FS`, serves it, runs the agent loop, hosts the MCP server, owns the tmux
+`embed.FS`, serves it, runs the agent loop, hosts the MCP server, owns the PTY
 sessions, and reads/writes the SQLite file. No external runtime, no container
-required to run it.
+required to run it. (No tmux dependency anymore — the terminal backend is
+in-process PTYs; see §2.)
 
 ---
 
@@ -81,12 +82,12 @@ required to run it.
 │     ├── HTTP server      serves embedded Vue assets + WS endpoint          │
 │     ├── Agent loop       calls LLM API, dispatches tool_use, feeds results │
 │     ├── MCP server       exposes terminal-driving + inventory tools        │
-│     ├── tmux manager     one pane per session; send-keys / capture-pane    │
+│     ├── PTY manager      one shell+PTY per session; write keys / VT mirror │
 │     ├── SQLite store     hosts, tags, facts, sessions, audit refs          │
 │     └── Audit proxy ─────► LLM API (Anthropic or OpenAI)                    │
 │                            (log-only; records every request + response)    │
 │                                                                            │
-│  ~/.ssh/{config,keys}   used by tmux shells exactly as a human's would be  │
+│  ~/.ssh/{config,keys}   used by the PTY shells exactly as a human's would  │
 └────────────────────────────────────────────────────────────────────────────┘
                                      │
                           ssh (typed into a session)
@@ -96,7 +97,7 @@ required to run it.
 
 The agent loop is the heart: browser sends a message → daemon calls the LLM
 through the audit proxy → LLM returns `tool_use` blocks → daemon executes them
-(tmux send-keys, capture-pane, SQLite queries) → daemon appends `tool_result`
+(PTY writes, VT-screen reads, SQLite queries) → daemon appends `tool_result`
 blocks → calls again → repeats until the LLM returns only text → stream that to
 the browser. Stop conditions and a per-turn tool-call cap are in §8.
 
@@ -116,7 +117,7 @@ their laptop. You act like a human at a terminal.
 
 CORE MODEL
 - You work through persistent terminal SESSIONS. A session is a live shell
-  (a tmux pane) that retains state between your actions — current directory,
+  (a PTY shell) that retains state between your actions — current directory,
   environment, and crucially WHICH HOST YOU ARE ON.
 - To reach a host that is only accessible via another host, you SSH in steps,
   exactly as a person would: open a session, type `ssh <intermediate>`, read
@@ -172,7 +173,7 @@ plus inventory tools.
 ### 5.1 Terminal-driving tools
 
 **`open_session`**
-Open a new shell session (a fresh tmux pane running the operator's default
+Open a new shell session (a fresh PTY running the operator's default
 shell on the laptop).
 - Input: `{ "label": string? }`  — optional human-readable label
 - Output: `{ "session_id": string, "label": string }`
@@ -218,7 +219,7 @@ to confirm the current host.
 - Output: `{ "sessions": [ { "session_id", "label", "status", "opened_at" } ] }`
 
 **`close_session`**
-Kill the tmux pane and mark the session closed.
+Kill the PTY shell and mark the session closed.
 - Input: `{ "session_id": "string" }`
 - Output: `{ "session_id": "string", "closed": true }`
 
@@ -321,7 +322,7 @@ CREATE TABLE host_facts (                 -- the model discovers these
 CREATE TABLE sessions (
   id         TEXT PRIMARY KEY,            -- session_id (uuid)
   host_id    INTEGER REFERENCES hosts(id),-- best-effort: where it STARTED targeting; may be null
-  tmux_name  TEXT NOT NULL,               -- pane / session identifier in tmux
+  tmux_name  TEXT NOT NULL,               -- legacy column name; now holds the PTY identity (e.g. "pty:<pid>")
   label      TEXT,
   status     TEXT NOT NULL,               -- open | closed
   opened_at  TEXT NOT NULL,
@@ -468,7 +469,7 @@ for step in 0..MAX_STEPS:                 # MAX_STEPS guards runaway loops
     if resp has only text:
         stream final text to browser; break
     for each tool_use in resp:
-        result = dispatch(tool_use)        # tmux / sqlite; this is the future gate point
+        result = dispatch(tool_use)        # PTY / sqlite; this is the future gate point
         emit tool_use + result to browser  # the "watch the commands" view
         append tool_result to messages
     append assistant(resp) + tool_results to messages
@@ -514,14 +515,14 @@ Rules:
   2. **Fleet dashboard** — lists hosts with their tags and last-known facts
      (with `observed_at`), and live sessions. Reads the same SQLite the daemon
      writes.
-- Optional nicety: stream a live tmux pane into the browser (e.g. an
-  xterm.js-style terminal view) so the operator can watch a session directly.
-  Not required for v1.
+- The live browser terminal streams a session's PTY directly into an xterm.js
+  view (the operator watches/drives the same shell the agent does). xterm.js owns
+  native selection + scrollback (the PTY is a plain byte stream — no tmux).
 - **Model selector.** A control in the chat view lets the operator pick the
   model per conversation (and switch mid-thread). Default is `claude-opus-4-8`.
   Offer at least: `claude-opus-4-8` (default, for real work) and a cheap model
   (e.g. Haiku) for debugging the loop, where model quality is irrelevant to
-  testing the tmux/sentinel/dispatch plumbing. The chosen model id is sent on
+  testing the PTY/sentinel/dispatch plumbing. The chosen model id is sent on
   the WebSocket with each chat message and passed straight into the agent
   loop's API call; the daemon does NOT hardcode the model — it uses the
   selected id, falling back to the active credential's model if none is sent.
@@ -617,9 +618,10 @@ SQLite** (`llm_credentials`), never in the environment.
 
 Each milestone is independently useful; ship them in order.
 
-1. **tmux MCP core** — `open_session` / `send_keys` / `read_screen` /
-   `close_session` with the done-sentinel. At this point an external MCP client
-   can already do multi-hop by typing. Test by `tmux attach` and watching.
+1. **PTY MCP core** — `open_session` / `send_keys` / `read_screen` /
+   `close_session` with the done-sentinel (sessions are daemon-owned PTYs; a VT
+   emulator mirrors each for `read_screen`). At this point an external MCP client
+   can already do multi-hop by typing.
 2. **SQLite inventory + inventory tools** — schema-less hosts/tags/facts.
 3. **Audit proxy** — log-only, streaming-aware, provider-agnostic.
 4. **Agent loop + WebSocket** — daemon owns the loop, streams transcript.

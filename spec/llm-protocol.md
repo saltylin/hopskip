@@ -377,7 +377,7 @@ else:
   operator sees the *exact* keystrokes/commands), and each result. This live
   transcript **is** the product UI (`CLAUDE.md` §9).
 - **`dispatch()` is the single side-effect choke point** (Invariant 5). It maps a
-  tool name + input to the in-process MCP tool handler (tmux / SQLite), and is the
+  tool name + input to the in-process MCP tool handler (PTY / SQLite), and is the
   one place the future **mutation-approval gate** will live — it can inspect the
   tool (e.g. `send_keys` with `destructive`/`openWorld` hints from
   `mcp-protocol.md` §4.3), pause for operator approval, then proceed or reject —

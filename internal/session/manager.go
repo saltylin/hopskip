@@ -1,7 +1,9 @@
-// Package session owns the tmux-backed terminal sessions. One tmux session per
-// Hopskip session, on a dedicated tmux socket so we never disturb the operator's
-// own tmux. Reaching a remote host is always the operator/agent typing `ssh`
-// into a session (CLAUDE.md invariant 1); nothing here opens a connection.
+// Package session owns the terminal sessions. Each session is a shell running on
+// a daemon-owned PTY (no tmux): the browser's xterm.js attaches directly, so it
+// owns native selection + scrollback exactly like a local terminal. A server-side
+// VT emulator (vt10x) mirrors each PTY so the agent's read_screen sees a faithful
+// rendered screen. Reaching a remote host is always the operator/agent typing
+// `ssh` into a session (CLAUDE.md invariant 1); nothing here opens a connection.
 package session
 
 import (
@@ -10,67 +12,75 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/creack/pty"
+	"github.com/hinshun/vt10x"
 
 	"github.com/saltylin/hopskip/internal/store"
 )
 
-// Manager creates and drives tmux sessions.
+const (
+	defaultRows    = 50
+	defaultCols    = 200
+	ringCap        = 512 * 1024 // recent raw output kept for reconnect replay
+	subBuf         = 256        // per-attach output backlog (localhost: never overflows)
+	defaultTimeout = 30000      // send_keys await default (ms)
+)
+
+// liveSession is one shell+PTY owned by the daemon, mirrored into a VT emulator.
+type liveSession struct {
+	id   string
+	ptmx *os.File
+	cmd  *exec.Cmd
+	vt   vt10x.Terminal // fed all PTY output; serialized by read_screen
+
+	mu     sync.Mutex
+	ring   []byte              // recent raw output (capped) for reconnect replay
+	subs   map[int]chan []byte // attached browser clients
+	nextID int
+	closed bool
+	rows   uint16
+	cols   uint16
+}
+
+// Manager creates and drives PTY sessions.
 type Manager struct {
-	tmuxBin  string
-	socket   string // tmux -L <socket>
-	store    *store.Store
-	confPath string // sourced tmux config (chained bindings argv can't express)
+	store *store.Store
+	shell string
+
+	mu   sync.Mutex
+	live map[string]*liveSession
 }
 
-// tmuxConf holds bindings that need command chaining (\;), which only parses in a
-// sourced config file. On the wheel, clear any selection BEFORE scrolling: a held
-// tmux selection is an active one, so scrolling would otherwise extend it ("drift").
-// Clearing first keeps the selection put while you don't scroll, and removes it
-// cleanly (no drift) the moment you do — the text was already copied on release.
-const tmuxConf = `bind-key -T copy-mode    WheelUpPane   send-keys -X clear-selection \; send-keys -X -N 3 scroll-up
-bind-key -T copy-mode    WheelDownPane send-keys -X clear-selection \; send-keys -X -N 3 scroll-down
-bind-key -T copy-mode-vi WheelUpPane   send-keys -X clear-selection \; send-keys -X -N 3 scroll-up
-bind-key -T copy-mode-vi WheelDownPane send-keys -X clear-selection \; send-keys -X -N 3 scroll-down
-`
-
-// NewManager returns a Manager bound to a tmux binary and the store.
-func NewManager(tmuxBin string, st *store.Store) *Manager {
-	if tmuxBin == "" {
-		tmuxBin = "tmux"
+// NewManager returns a Manager. It uses the operator's $SHELL (else /bin/bash,
+// else /bin/sh) for new sessions.
+func NewManager(st *store.Store) *Manager {
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		for _, c := range []string{"/bin/bash", "/bin/sh"} {
+			if _, err := os.Stat(c); err == nil {
+				shell = c
+				break
+			}
+		}
 	}
-	m := &Manager{tmuxBin: tmuxBin, socket: "hopskip", store: st}
-	m.confPath = filepath.Join(os.TempDir(), "hopskip-tmux.conf")
-	_ = os.WriteFile(m.confPath, []byte(tmuxConf), 0o644)
-	return m
+	return &Manager{store: st, shell: shell, live: map[string]*liveSession{}}
 }
 
-// Available reports whether the tmux binary works.
+// Available reports whether a shell is usable.
 func (m *Manager) Available() error {
-	out, err := m.tmux("-V").CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("tmux not usable (%s): %v: %s", m.tmuxBin, err, strings.TrimSpace(string(out)))
+	if m.shell == "" {
+		return fmt.Errorf("no shell found (set $SHELL)")
+	}
+	if _, err := os.Stat(m.shell); err != nil {
+		return fmt.Errorf("shell %s not usable: %w", m.shell, err)
 	}
 	return nil
-}
-
-func (m *Manager) tmux(args ...string) *exec.Cmd {
-	full := append([]string{"-L", m.socket}, args...)
-	return exec.Command(m.tmuxBin, full...)
-}
-
-// run executes a tmux subcommand and returns trimmed combined output.
-func (m *Manager) run(args ...string) (string, error) {
-	out, err := m.tmux(args...).CombinedOutput()
-	if err != nil {
-		return strings.TrimSpace(string(out)), fmt.Errorf("tmux %s: %v: %s",
-			strings.Join(args, " "), err, strings.TrimSpace(string(out)))
-	}
-	return strings.TrimSpace(string(out)), nil
 }
 
 func randHex(n int) string {
@@ -79,119 +89,149 @@ func randHex(n int) string {
 	return hex.EncodeToString(b)
 }
 
-// Open creates a new detached tmux session and records it. It starts on the
+// Open spawns a shell on a fresh PTY and records the session. It starts on the
 // laptop; to reach a host the caller types `ssh ...` via SendKeys (or the
 // operator types it in the browser terminal).
 func (m *Manager) Open(label string, hostID *int64) (store.Session, error) {
 	id := randHex(16)
-	tmuxName := "hs_" + id[:10]
 	if label == "" {
-		label = tmuxName
+		label = "session-" + id[:6]
 	}
-	// Create the session with a DEEP scrollback. With standard (alternate-screen)
-	// tmux rendering the display stays clean and the wheel scrolls tmux's own
-	// history — so scroll depth is tmux's history-limit, which must be set on the
-	// server BEFORE the session is created. We do both in one invocation because
-	// an empty tmux server exits between separate commands. (The smcup/status
-	// "conduit" we tried corrupts the buffer: tmux repaints with cursor
-	// addressing, which the browser's scrollback cannot reconcile — stale/missing
-	// lines. So we DON'T disable the alt screen.)
-	hist := strconv.Itoa(historyLimit(m.store))
-	if _, err := m.run(
-		"set-option", "-g", "history-limit", hist, ";",
-		"new-session", "-d", "-s", tmuxName, "-x", "200", "-y", "50",
-	); err != nil {
-		return store.Session{}, err
+	cmd := exec.Command(m.shell)
+	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
+	ws := &pty.Winsize{Rows: defaultRows, Cols: defaultCols}
+	ptmx, err := pty.StartWithSize(cmd, ws)
+	if err != nil {
+		return store.Session{}, fmt.Errorf("start shell: %w", err)
 	}
-	// mouse ON gives tmux's native, reliable behavior: the wheel scrolls history
-	// (no synthetic keys that could leak into the shell), and the selection is
-	// anchored to the buffer (it doesn't drift when you scroll). The only tweaks
-	// fix the two real annoyances of tmux's defaults:
-	//   - drag-end HOLDS the selection (copy-selection-no-clear) instead of
-	//     copy-and-cancel — so the highlight stays and the view does NOT jump to
-	//     the bottom; the text is copied to the system clipboard via OSC 52
-	//     (set-clipboard on + the advertised Ms capability).
-	//   - a plain click: at the live bottom it exits copy-mode (resume typing);
-	//     when SCROLLED UP it only clears the selection and STAYS put — so a click
-	//     never yanks the view down to the bottom. (Scrolling back to the bottom
-	//     also resumes typing.)
-	// Standard alt-screen rendering keeps the display clean.
-	_, _ = m.run("set-option", "-g", "mouse", "on")
-	_, _ = m.run("set-option", "-g", "set-clipboard", "on")
-	_, _ = m.run("set-option", "-g", "terminal-overrides", `,*:Ms=\E]52;%p1%s;%p2%s\7`)
-	for _, tbl := range []string{"copy-mode", "copy-mode-vi"} {
-		_, _ = m.run("bind-key", "-T", tbl, "MouseDragEnd1Pane", "send-keys", "-X", "copy-selection-no-clear")
-		_, _ = m.run("bind-key", "-T", tbl, "MouseUp1Pane",
-			"if-shell", "-F", "#{==:#{scroll_position},0}",
-			"send-keys -X cancel", "send-keys -X clear-selection")
+	ls := &liveSession{
+		id:   id,
+		ptmx: ptmx,
+		cmd:  cmd,
+		vt:   vt10x.New(vt10x.WithSize(defaultCols, defaultRows)),
+		subs: map[int]chan []byte{},
+		rows: defaultRows,
+		cols: defaultCols,
 	}
-	// wheel bindings that clear the selection before scrolling (need \; chaining)
-	if m.confPath != "" {
-		_, _ = m.run("source-file", m.confPath)
-	}
-	if err := m.store.CreateSession(id, hostID, tmuxName, label); err != nil {
-		_, _ = m.run("kill-session", "-t", tmuxName) // best-effort rollback
+	m.mu.Lock()
+	m.live[id] = ls
+	m.mu.Unlock()
+	go m.pump(ls)
+
+	name := fmt.Sprintf("pty:%d", cmd.Process.Pid)
+	if err := m.store.CreateSession(id, hostID, name, label); err != nil {
+		_ = m.kill(ls)
 		return store.Session{}, err
 	}
 	return m.store.GetSession(id)
 }
 
-// historyLimit is tmux's scrollback depth (lines), from the operator-tunable
-// terminal_scrollback setting (the same knob the browser terminal uses), else a
-// generous default.
-func historyLimit(st *store.Store) int {
-	if v, ok := st.GetSetting("terminal_scrollback"); ok {
-		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 100 {
-			return n
+// pump streams PTY output into the VT mirror, the replay ring, and every attached
+// browser. On EOF (shell exited) it tears the session down.
+func (m *Manager) pump(ls *liveSession) {
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := ls.ptmx.Read(buf)
+		if n > 0 {
+			b := buf[:n]
+			_, _ = ls.vt.Write(b)
+			ls.mu.Lock()
+			ls.ring = append(ls.ring, b...)
+			if len(ls.ring) > ringCap {
+				ls.ring = ls.ring[len(ls.ring)-ringCap:]
+			}
+			for _, ch := range ls.subs {
+				select {
+				case ch <- append([]byte(nil), b...):
+				default: // localhost browser fell behind; reconnect replay recovers it
+				}
+			}
+			ls.mu.Unlock()
+		}
+		if err != nil {
+			m.teardown(ls)
+			return
 		}
 	}
-	return 100000
 }
 
-// tmuxNameFor resolves the live tmux session name for an open session id.
-func (m *Manager) tmuxNameFor(id string) (string, error) {
-	ss, err := m.store.GetSession(id)
-	if err != nil {
-		return "", err
+// teardown marks the session closed and notifies attached browsers (closing their
+// channels makes Attach.Read return io.EOF).
+func (m *Manager) teardown(ls *liveSession) {
+	ls.mu.Lock()
+	if ls.closed {
+		ls.mu.Unlock()
+		return
 	}
-	if ss.Status != "open" {
-		return "", fmt.Errorf("session %s is %s", id, ss.Status)
+	ls.closed = true
+	for id, ch := range ls.subs {
+		close(ch)
+		delete(ls.subs, id)
 	}
-	return ss.TmuxName, nil
+	ls.mu.Unlock()
+	m.mu.Lock()
+	delete(m.live, ls.id)
+	m.mu.Unlock()
+	_ = m.store.CloseSession(ls.id)
 }
 
-// Close kills the tmux session and marks the record closed.
+func (m *Manager) kill(ls *liveSession) error {
+	_ = ls.ptmx.Close()
+	if ls.cmd.Process != nil {
+		_ = ls.cmd.Process.Kill()
+	}
+	_, _ = ls.cmd.Process.Wait()
+	return nil
+}
+
+func (m *Manager) get(id string) (*liveSession, error) {
+	m.mu.Lock()
+	ls := m.live[id]
+	m.mu.Unlock()
+	if ls == nil {
+		return nil, fmt.Errorf("session %s is not open", id)
+	}
+	return ls, nil
+}
+
+// Close kills the shell and marks the session closed.
 func (m *Manager) Close(id string) error {
-	ss, err := m.store.GetSession(id)
+	ls, err := m.get(id)
 	if err != nil {
-		return err
+		// already gone from the live map; ensure the DB reflects closed
+		return m.store.CloseSession(id)
 	}
-	_, _ = m.run("kill-session", "-t", ss.TmuxName) // ignore: pane may already be gone
-	return m.store.CloseSession(id)
+	_ = m.kill(ls)
+	m.teardown(ls)
+	return nil
 }
 
-// Capture returns the visible pane contents. lines>0 limits to the last N lines.
+// CloseAllInDB marks every 'open' session closed — used on daemon startup, since
+// PTYs do not survive a restart (the live map starts empty).
+func (m *Manager) CloseAllInDB() error {
+	return m.store.MarkStaleSessionsClosed(func(string) bool { return false })
+}
+
+// Capture returns the current rendered screen of the session's VT mirror (the
+// agent's read_screen). lines>0 trims to the last N visible lines.
 func (m *Manager) Capture(id string, lines int) (string, error) {
-	name, err := m.tmuxNameFor(id)
+	ls, err := m.get(id)
 	if err != nil {
 		return "", err
 	}
-	args := []string{"capture-pane", "-p", "-J", "-t", name}
+	screen := normalizeScreen(ls.vt.String())
 	if lines > 0 {
-		args = append(args, "-S", "-"+strconv.Itoa(lines))
+		ll := strings.Split(screen, "\n")
+		if len(ll) > lines {
+			screen = strings.Join(ll[len(ll)-lines:], "\n")
+		}
 	}
-	out, err := m.tmux(args...).Output()
-	if err != nil {
-		return "", fmt.Errorf("capture-pane: %w", err)
-	}
-	return normalizeScreen(string(out)), nil
+	return screen, nil
 }
 
-// normalizeScreen tidies a captured pane for tool results: right-trims each line,
-// drops leading/trailing blank lines (tmux pads the capture to the full pane
-// height, producing the long run of empty lines at the bottom), and collapses any
-// internal run of 2+ blank lines to one. This is display-and-model hygiene only —
-// the live terminal stream uses a separate PTY path and is untouched. (CLAUDE.md
+// normalizeScreen tidies a rendered VT screen for tool results: right-trims each
+// line, drops leading/trailing blank lines (the grid is padded to the full pane
+// height), and collapses any internal run of 2+ blank lines to one. (CLAUDE.md
 // MCP spec §6.5: screen normalization SHOULD.)
 func normalizeScreen(s string) string {
 	lines := strings.Split(s, "\n")
@@ -221,56 +261,37 @@ func normalizeScreen(s string) string {
 	return strings.Join(out, "\n")
 }
 
-// sendText types text into a pane, translating '\n' into Enter keypresses.
-func (m *Manager) sendText(name, text string) error {
-	parts := strings.Split(text, "\n")
-	for i, p := range parts {
-		if p != "" {
-			if _, err := m.run("send-keys", "-t", name, "-l", "--", p); err != nil {
-				return err
-			}
-		}
-		if i < len(parts)-1 {
-			if _, err := m.run("send-keys", "-t", name, "Enter"); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
 var sentinelLine = regexp.MustCompile(`__HOPSKIP_DONE_`)
 
-// SendKeys types keystrokes into a session. With awaitDone it wraps the command
-// in a done-sentinel and blocks until the sentinel resolves or timeout elapses
-// (see CLAUDE.md §5.3). With awaitDone=false it sends verbatim and returns at
-// once — use that for interactive prompts and long-running commands.
+// SendKeys types keystrokes into a session by writing to its PTY ('\n' becomes a
+// carriage return, like a real Enter). With awaitDone it wraps the command in a
+// done-sentinel and blocks until the sentinel resolves on screen or the timeout
+// elapses (CLAUDE.md §5.3). With awaitDone=false it writes verbatim and returns
+// at once — use that for interactive prompts and long-running commands.
 func (m *Manager) SendKeys(id, keys string, awaitDone bool, timeoutMs int) (screen string, exitCode *int, completed bool, err error) {
-	name, err := m.tmuxNameFor(id)
+	ls, err := m.get(id)
 	if err != nil {
 		return "", nil, false, err
 	}
 	if !awaitDone {
-		if err := m.sendText(name, keys); err != nil {
+		if _, err := ls.ptmx.Write([]byte(toCR(keys))); err != nil {
 			return "", nil, false, err
 		}
+		time.Sleep(120 * time.Millisecond) // let the shell echo/render
 		screen, err = m.Capture(id, 0)
 		return screen, nil, false, err
 	}
 
 	nonce := randHex(6)
 	cmd := strings.TrimSuffix(keys, "\n")
-	line := fmt.Sprintf(`%s; echo "__HOPSKIP_DONE_$?_%s__"`, cmd, nonce)
-	if err := m.sendText(name, line); err != nil {
-		return "", nil, false, err
-	}
-	if _, err := m.run("send-keys", "-t", name, "Enter"); err != nil {
+	line := fmt.Sprintf("%s; echo \"__HOPSKIP_DONE_$?_%s__\"\n", cmd, nonce)
+	if _, err := ls.ptmx.Write([]byte(toCR(line))); err != nil {
 		return "", nil, false, err
 	}
 
 	re := regexp.MustCompile(`__HOPSKIP_DONE_(\d+)_` + nonce + `__`)
 	if timeoutMs <= 0 {
-		timeoutMs = 30000
+		timeoutMs = defaultTimeout
 	}
 	deadline := time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)
 	for {
@@ -289,8 +310,11 @@ func (m *Manager) SendKeys(id, keys string, awaitDone bool, timeoutMs int) (scre
 	}
 }
 
-// stripSentinel removes sentinel artifact lines (both the echoed command line
-// and the resolved output line) so callers see clean output.
+// toCR maps '\n' (the tool's Enter convention) to '\r', what a real Enter sends.
+func toCR(s string) string { return strings.ReplaceAll(s, "\n", "\r") }
+
+// stripSentinel removes the sentinel artifact lines (the echoed command and the
+// resolved output line) so callers see clean output.
 func stripSentinel(screen string) string {
 	lines := strings.Split(screen, "\n")
 	out := lines[:0]
@@ -301,19 +325,4 @@ func stripSentinel(screen string) string {
 		out = append(out, l)
 	}
 	return strings.Join(out, "\n")
-}
-
-// LiveTmuxNames returns the set of tmux session names currently alive.
-func (m *Manager) LiveTmuxNames() map[string]bool {
-	out, err := m.tmux("list-sessions", "-F", "#{session_name}").Output()
-	live := map[string]bool{}
-	if err != nil {
-		return live // no server / no sessions
-	}
-	for _, l := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if l != "" {
-			live[l] = true
-		}
-	}
-	return live
 }

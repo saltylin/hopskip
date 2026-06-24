@@ -1,7 +1,7 @@
 # Installing hopskip
 
 hopskip is a **single Go binary**: it embeds the Vue frontend (`web/` via
-`embed.FS`), owns the tmux sessions, runs the agent loop, and uses one local
+`embed.FS`), owns the PTY sessions, runs the agent loop, and uses one local
 SQLite file. There is no separate frontend build and nothing to run alongside it.
 
 > This is a **local, single-operator** tool — run it on your own laptop. Your SSH
@@ -15,13 +15,12 @@ SQLite file. There is no separate frontend build and nothing to run alongside it
 | Need | Why | Install (macOS) | Install (Debian/Ubuntu) |
 |------|-----|-----------------|--------------------------|
 | **Go** (recent toolchain) | builds the binary; `go.mod` auto-selects the version | `brew install go` | `sudo apt install golang` (or [go.dev/dl](https://go.dev/dl/)) |
-| **tmux** | the terminal/session backend (one pane per session) | `brew install tmux` | `sudo apt install tmux` |
 
-Check them:
+That's it — sessions run on daemon-owned PTYs using your `$SHELL` (else
+`/bin/bash`/`/bin/sh`). **No tmux required.** Check Go:
 
 ```sh
 go version     # e.g. go1.25.x
-tmux -V        # e.g. tmux 3.x
 ```
 
 You'll also want an **LLM API key** to actually drive the fleet from chat — an
@@ -100,7 +99,6 @@ reserved for what the process needs *before* it can open the DB:
 ```sh
 HOPSKIP_ADDR=127.0.0.1:8765      # listen address
 HOPSKIP_DB_PATH=hopskip.db       # SQLite file
-HOPSKIP_TMUX_BIN=tmux            # tmux binary, if not on PATH
 HOPSKIP_WEB_DIR=                 # optional disk overlay for hand-editing the UI (dev)
 ```
 
@@ -128,7 +126,7 @@ shell). The agent can also author UI at runtime from chat (the **Changes** tab a
 
 ## 8. Troubleshooting
 
-- **`tmux not usable`** — install tmux, or set `HOPSKIP_TMUX_BIN` to its path.
+- **`no shell found`** — set `$SHELL` to a usable shell (sessions run on PTYs).
 - **`go build` hangs/fails fetching modules** (restrictive corporate network) — use
   a public module proxy:
   ```sh

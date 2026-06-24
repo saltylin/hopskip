@@ -210,7 +210,17 @@ an accepted, documented edge — names are normally human words.
 
 ## 5. Terminal-driving tools
 
-These drive tmux panes. A **session** = one tmux pane running the operator's
+> **AMENDED (as built):** the terminal backend is now **daemon-owned PTYs**, not
+> tmux (see `CLAUDE.md` §2). The tool *contracts* below are unchanged — only the
+> implementation differs: a session is a shell on a `creack/pty` master; keystrokes
+> are written to the PTY (`\n`→`\r`); `read_screen` serializes a server-side VT
+> emulator (`hinshun/vt10x`) mirroring the PTY; `close` kills the shell. So
+> "tmux pane / capture-pane / send-keys / kill-pane" in this section now read as
+> "PTY shell / VT screen / PTY write / kill shell". Sessions no longer survive a
+> daemon restart (the live map is in-process; on startup any still-`open` DB rows
+> are marked closed).
+
+These drive PTY shells. A **session** = one shell on a PTY running the operator's
 default login shell, starting **on the laptop**. Reaching a remote host is always
 the model typing `ssh …` into the session (Invariant 1). The session is the only
 authoritative answer to "where am I"; the DB is a hint (Invariant 2).
