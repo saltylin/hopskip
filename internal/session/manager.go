@@ -313,6 +313,81 @@ func (m *Manager) SendKeys(id, keys string, awaitDone bool, timeoutMs int) (scre
 // toCR maps '\n' (the tool's Enter convention) to '\r', what a real Enter sends.
 func toCR(s string) string { return strings.ReplaceAll(s, "\n", "\r") }
 
+// Remote reports whether the session is currently logged into a remote host —
+// i.e. there is a live `ssh` process anywhere in the session shell's process
+// subtree. When you exit back to the laptop shell, the ssh process is gone and
+// this returns false. (Only the FIRST hop runs on the laptop; deeper hops run on
+// the intermediate hosts — but one ssh in the local tree is enough to mean
+// "you're on a remote host".)
+func (m *Manager) Remote(id string) (bool, error) {
+	ls, err := m.get(id)
+	if err != nil {
+		return false, err
+	}
+	if ls.cmd.Process == nil {
+		return false, nil
+	}
+	return sshInSubtree(ls.cmd.Process.Pid), nil
+}
+
+// sshInSubtree reports whether an `ssh` process runs under root, from a live
+// `ps` snapshot. The parsing/walk is in sshInPsOutput so it can be unit-tested.
+func sshInSubtree(root int) bool {
+	out, err := exec.Command("ps", "-axo", "pid=,ppid=,comm=").Output()
+	if err != nil {
+		return false
+	}
+	return sshInPsOutput(string(out), root)
+}
+
+// sshInPsOutput walks the process tree under root (parsed from `ps -axo
+// pid=,ppid=,comm=` output) looking for a process whose command basename is
+// exactly "ssh" (so "sshd"/"ssh-agent"/"scp" do not match). macOS `comm` is a
+// full path, Linux is the bare name — baseName handles both.
+func sshInPsOutput(psout string, root int) bool {
+	children := map[int][]int{}
+	comm := map[int]string{}
+	for _, line := range strings.Split(psout, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 3 {
+			continue
+		}
+		pid, e1 := strconv.Atoi(f[0])
+		ppid, e2 := strconv.Atoi(f[1])
+		if e1 != nil || e2 != nil {
+			continue
+		}
+		comm[pid] = strings.Join(f[2:], " ")
+		children[ppid] = append(children[ppid], pid)
+	}
+	queue := []int{root}
+	seen := map[int]bool{root: true}
+	for len(queue) > 0 {
+		pid := queue[0]
+		queue = queue[1:]
+		for _, c := range children[pid] {
+			if seen[c] {
+				continue
+			}
+			seen[c] = true
+			if baseName(comm[c]) == "ssh" {
+				return true
+			}
+			queue = append(queue, c)
+		}
+	}
+	return false
+}
+
+// baseName returns the last path segment of a command (macOS `ps comm` gives a
+// full path; Linux gives the bare name).
+func baseName(s string) string {
+	if i := strings.LastIndexByte(s, '/'); i >= 0 {
+		return s[i+1:]
+	}
+	return s
+}
+
 // stripSentinel removes the sentinel artifact lines (the echoed command and the
 // resolved output line) so callers see clean output.
 func stripSentinel(screen string) string {

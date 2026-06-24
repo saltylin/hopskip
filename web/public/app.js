@@ -152,7 +152,7 @@ const TermView = {
     scrollback: { type: Number, default: 100000 },
   },
   emits: ['close'],
-  data() { return { connected: false, loggedIn: this.startConnected } },
+  data() { return { connected: false, loggedIn: this.startConnected, remote: false } },
   computed: {
     hasConnect() { return this.steps.length > 0 },
     hops() { return this.steps.length },
@@ -235,13 +235,27 @@ const TermView = {
 
     this.ro = new ResizeObserver(() => { try { fit.fit(); this.sendResize() } catch (e) {} })
     this.ro.observe(this.$refs.term)
+
+    // Poll whether the session is currently logged into a remote host (an ssh
+    // process in its subtree), so the live dot reflects ssh-session liveness, not
+    // just the pipe. Goes back to "local" when you exit ssh.
+    this.pollState()
+    this._stateT = setInterval(() => this.pollState(), 2500)
   },
   beforeUnmount() {
     if (this.ro) this.ro.disconnect()
+    if (this._stateT) clearInterval(this._stateT)
     if (this.ws) { this.ws.onclose = null; this.ws.close() }
     if (this.term) this.term.dispose()
   },
   methods: {
+    async pollState() {
+      try {
+        const s = await api('GET', '/api/sessions/' + this.session.session_id + '/state')
+        this.remote = !!s.remote
+        if (s.open === false) this.connected = false
+      } catch (e) { this.remote = false }
+    },
     sendResize() {
       if (this.ws && this.ws.readyState === 1) {
         this.ws.send(JSON.stringify({ type: 'resize', cols: this.term.cols, rows: this.term.rows }))
@@ -273,7 +287,8 @@ const TermView = {
         <span class="title">{{ host ? host.name : 'scratch terminal' }}</span>
         <span class="host-meta" v-if="targetLabel">ssh {{ targetLabel }}<span v-if="hops > 1"> · {{ hops - 1 }} hop{{ hops > 2 ? 's' : '' }}</span></span>
         <span class="spacer"></span>
-        <span class="dim" style="font-size:12px">{{ connected ? '● live' : '○ closed' }}</span>
+        <span class="term-status" :class="{ live: connected && remote }" style="font-size:12px"
+              :title="!connected ? 'terminal disconnected' : remote ? 'logged into a remote host (ssh active)' : 'at the local shell (no ssh)'">{{ !connected ? '○ closed' : remote ? '● ssh' : '○ local' }}</span>
         <template v-if="hasConnect">
           <button v-if="!loggedIn" class="conn-pill" @click="doConnect()">{{ connectBtnLabel }}</button>
           <template v-else>

@@ -61,6 +61,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/sessions", s.handleListSessions)
 	mux.HandleFunc("POST /api/sessions", s.handleOpenSession)
 	mux.HandleFunc("POST /api/sessions/{id}/keys", s.handleSendKeys)
+	mux.HandleFunc("GET /api/sessions/{id}/state", s.handleSessionState)
 	mux.HandleFunc("DELETE /api/sessions/{id}", s.handleCloseSession)
 
 	mux.HandleFunc("GET /ws/term/{id}", s.handleTermWS)
@@ -379,6 +380,24 @@ func (s *Server) handleCloseSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"session_id": id, "closed": true})
+}
+
+// handleSessionState reports whether a session is open and currently logged into
+// a remote host (an ssh process in its subtree) — drives the terminal's live
+// indicator so it reflects ssh-session liveness, not just the pipe.
+func (s *Server) handleSessionState(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	ss, err := s.store.GetSession(id)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "no such session")
+		return
+	}
+	open := ss.Status == "open"
+	remote := false
+	if open {
+		remote, _ = s.mgr.Remote(id)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"session_id": id, "open": open, "remote": remote})
 }
 
 // ---- static / SPA ----

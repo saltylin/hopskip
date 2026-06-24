@@ -148,6 +148,9 @@ body {
   font-family: var(--mono);
 }
 .term-hint { font-size: 11px; margin-right: 4px; cursor: help; white-space: nowrap; }
+/* terminal live/closed indicator: green dot while the PTY pipe is connected */
+.term-status { color: var(--fg-dim); }
+.term-status.live { color: var(--accent-2); }
 
 /* contained error cards for broken authored extensions — never a blank shell */
 .ext-errors { padding: 8px 12px 0; display: flex; flex-direction: column; gap: 6px; }
