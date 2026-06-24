@@ -247,6 +247,11 @@ notes — e.g. "run `mykinit` before ssh" — are always in context)
 **`fetch_url`** — `{ "url", "save_as"? }` → downloads an http(s) URL **through the
 laptop** (and its proxy), saving it ON THE LAPTOP; to put it on a host the model
 copies it FROM a laptop session (never from the host). For network-restricted hosts.
+**`http_request`** — `{ "url", "method"?, "headers"?, "body"?, "save_as"? }` → makes
+an arbitrary HTTP request **through the laptop and its configured proxy** (the
+"don't shell out to curl" tool), returning `{ status, headers, body }`. Body inline
+when textual+small, else saved on the laptop. Request auth headers stay local and
+are not echoed back.
 
 ### 5.2b Frontend self-programming tools
 

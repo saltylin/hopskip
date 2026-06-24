@@ -22,7 +22,7 @@ MCP client such as Claude Code) and the fleet. There are two tool families:
 |-------------------|-----------------------------------------------------------------------|----------------------|
 | Terminal-driving  | `open_session`, `send_keys`, `read_screen`, `list_sessions`, `close_session` | tmux panes           |
 | Inventory         | `list_hosts`, `get_host`, `add_host`, `rename_host`, `tag_host`, `forget_tag`, `record_fact`, `forget_fact` | SQLite (schema-less) |
-| Knowledge + fetch | `remember`, `list_knowledge`, `forget_knowledge`, `fetch_url`         | SQLite + laptop network |
+| Knowledge + fetch | `remember`, `list_knowledge`, `forget_knowledge`, `fetch_url`, `http_request` | SQLite + laptop network (proxy-aware) |
 | Frontend extension *(optional)* | `list_web_files`, `read_web_file`, `write_web_file`, `delete_web_file`, `register_extension`, `unregister_extension`, `list_extensions` | SQLite (`web_files` + `web_extensions`) |
 
 > **Implemented names.** This table reflects the shipped tool names. (Earlier

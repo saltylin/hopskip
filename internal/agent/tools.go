@@ -84,12 +84,17 @@ CONDUCT
   which host, and why, before running it.
 - Prefer key-based auth. If you must type a secret, know it may be captured in
   the session screen; minimize exposure.
+- To make an HTTP request (call an API, check an endpoint, hit a webhook), use the
+  http_request tool rather than running curl/wget/httpie in a shell session: it
+  goes through the operator's laptop and its configured proxy, keeps any auth
+  tokens on the laptop, and returns a clean { status, headers, body }. Reach for a
+  shell HTTP client only when the request must originate FROM a specific host.
 - Some hosts are network-restricted and can't reach certain sites (e.g. overseas
   ones). When that applies — usually the operator will have told you, recorded
-  under OPERATOR KNOWLEDGE — fetch the file through the operator's laptop with
-  fetch_url (it uses the laptop's network/proxy). The downloaded file lives ON
-  THE LAPTOP at the path the tool returns. Don't assume a host is restricted
-  unless you were told or you observe it failing.
+  under OPERATOR KNOWLEDGE — go through the operator's laptop/proxy: fetch_url to
+  download a file, or http_request for an API call. A downloaded file lives ON THE
+  LAPTOP at the path the tool returns. Don't assume a host is restricted unless you
+  were told or you observe it failing.
 - To get a laptop-downloaded file ONTO a host, the copy MUST run FROM THE LAPTOP
   — the laptop has the file and can reach the host; the host has NEITHER the file
   NOR a route back to the laptop. So: call open_session to get a fresh session
@@ -137,6 +142,14 @@ func toolSpecs() []toolSpec {
 		{"forget_tag", "Remove an operator-asserted tag from a host (the counterpart to tag_host).", map[string]any{"host": str, "key": str}, []string{"host", "key"}},
 		{"fetch_url", "Download an http(s) URL THROUGH THE OPERATOR'S LAPTOP (which can reach sites a remote host may not, and uses the configured proxy). The file is saved ON THE LAPTOP at the returned absolute path; small text files are also returned inline. IMPORTANT: to put the file onto a host, the copy MUST run FROM THE LAPTOP — call open_session (it starts on the laptop), confirm you are on the laptop, then scp to the host (for a host behind a jump host: scp -J <gateway> -P <port> <laptop-path> user@host:<dest>; scp uses uppercase -P for the port). NEVER scp from a session that is already on the host — it has neither the file nor a route back to the laptop.",
 			map[string]any{"url": str, "save_as": str}, []string{"url"}},
+		{"http_request", "Make an HTTP request THROUGH THE OPERATOR'S LAPTOP and its configured network proxy, and get the response back. PREFER THIS over running curl/wget/httpie in a shell session — it uses the operator's proxy automatically, keeps auth tokens on the laptop, and returns a clean structured result. Use it to call APIs, check endpoints, hit webhooks, etc. — especially when a remote host can't reach a site or you need the proxy. Supports any method, custom headers, and a request body. Returns { status, headers, body } — the body is inline when it's textual and not too large, otherwise saved on the laptop with a note. (For plain file downloads you intend to copy to a host, fetch_url is more convenient.)",
+			map[string]any{
+				"url":     str,
+				"method":  str,
+				"headers": map[string]any{"type": "object", "additionalProperties": str, "description": "request headers, name->value"},
+				"body":    str,
+				"save_as": str,
+			}, []string{"url"}},
 		{"remember", "Save a durable fact or instruction the operator told you to remember; it is loaded into your context in EVERY future chat. Use it whenever the operator tells you something about their environment, conventions, or how to handle a situation that you should not forget.",
 			map[string]any{"text": str}, []string{"text"}},
 		{"list_knowledge", "List the durable facts/instructions you have remembered (with their ids).", map[string]any{}, nil},
@@ -498,6 +511,19 @@ func (d *Dispatcher) Dispatch(name string, input json.RawMessage) (string, bool)
 		}
 		return d.fetchURL(strings.TrimSpace(in.URL), strings.TrimSpace(in.SaveAs))
 
+	case "http_request":
+		var in struct {
+			URL     string            `json:"url"`
+			Method  string            `json:"method"`
+			Headers map[string]string `json:"headers"`
+			Body    string            `json:"body"`
+			SaveAs  string            `json:"save_as"`
+		}
+		if err := json.Unmarshal(input, &in); err != nil {
+			return errStr(err), true
+		}
+		return d.httpRequest(strings.TrimSpace(in.URL), in.Method, in.Headers, in.Body, strings.TrimSpace(in.SaveAs))
+
 	case "remember":
 		var in struct {
 			Text string `json:"text"`
@@ -807,6 +833,105 @@ func (d *Dispatcher) fetchURL(rawURL, saveAs string) (string, bool) {
 		res["text"] = buf.String()
 	} else {
 		res["note"] = "saved ON THE LAPTOP at " + fp + ". To deliver it to a host, open_session (starts on the laptop), confirm you're on the laptop, then scp from there: scp [-J <gateway>] [-P <port>] " + fp + " user@host:<dest>. Do NOT scp from a session that is already on the host."
+	}
+	return jsonStr(res), resp.StatusCode >= 400
+}
+
+// httpRequest makes an arbitrary HTTP request through the operator's proxy-aware
+// client and returns the structured response. This is the "don't shell out to
+// curl" tool: methods, headers, and a body are supported; the response body is
+// returned inline when textual and small, else saved on the laptop. Request
+// headers/body (which may carry auth) are NOT echoed back into the transcript.
+func (d *Dispatcher) httpRequest(rawURL, method string, headers map[string]string, body, saveAs string) (string, bool) {
+	if rawURL == "" {
+		return errStr(fmt.Errorf("url is required")), true
+	}
+	if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
+		return errStr(fmt.Errorf("url must start with http:// or https://")), true
+	}
+	method = strings.ToUpper(strings.TrimSpace(method))
+	if method == "" {
+		method = "GET"
+	}
+	var bodyReader io.Reader
+	if body != "" {
+		bodyReader = strings.NewReader(body)
+	}
+	req, err := http.NewRequest(method, rawURL, bodyReader)
+	if err != nil {
+		return errStr(err), true
+	}
+	req.Header.Set("User-Agent", "hopskip-http/1")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	client := d.client
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return errStr(err), true
+	}
+	defer resp.Body.Close()
+
+	// Read the body bounded by a hard cap to protect memory; flag truncation.
+	const hardCap = 8 << 20    // 8 MiB read bound
+	const maxInline = 256 << 10 // inline up to 256 KiB of textual body
+	data, readErr := io.ReadAll(io.LimitReader(resp.Body, hardCap+1))
+	if readErr != nil {
+		return errStr(readErr), true
+	}
+	truncated := len(data) > hardCap
+	if truncated {
+		data = data[:hardCap]
+	}
+
+	// Response headers are safe to surface (they come from the server).
+	respHeaders := map[string]string{}
+	for k := range resp.Header {
+		respHeaders[k] = resp.Header.Get(k)
+	}
+	ct := resp.Header.Get("Content-Type")
+	res := map[string]any{
+		"url": rawURL, "method": method, "status": resp.StatusCode,
+		"status_text": http.StatusText(resp.StatusCode),
+		"headers":     respHeaders, "bytes": len(data),
+	}
+	if truncated {
+		res["truncated"] = true
+	}
+
+	textual := looksTextual(ct, data)
+	switch {
+	case saveAs != "":
+		// explicit save → write the body to the laptop's download dir
+		if err := os.MkdirAll(d.dlDir, 0o755); err != nil {
+			return errStr(err), true
+		}
+		fp := filepath.Join(d.dlDir, safeName(saveAs))
+		if err := os.WriteFile(fp, data, 0o644); err != nil {
+			return errStr(err), true
+		}
+		res["path"] = fp
+		res["saved_on"] = "operator laptop"
+		if textual && len(data) <= maxInline {
+			res["body"] = string(data) // small enough to also include inline
+		}
+	case textual && len(data) <= maxInline:
+		res["body"] = string(data)
+	case len(data) == 0:
+		// no body (e.g. a 204 or HEAD); nothing to add
+	default:
+		// binary or too large to inline → save it
+		if err := os.MkdirAll(d.dlDir, 0o755); err == nil {
+			fp := filepath.Join(d.dlDir, safeName(filenameFromURL(rawURL)))
+			if os.WriteFile(fp, data, 0o644) == nil {
+				res["path"] = fp
+				res["saved_on"] = "operator laptop"
+			}
+		}
+		res["note"] = "response body is binary or large; saved on the laptop (see path). Not inlined."
 	}
 	return jsonStr(res), resp.StatusCode >= 400
 }

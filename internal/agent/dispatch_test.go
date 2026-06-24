@@ -2,6 +2,7 @@ package agent
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -30,6 +31,89 @@ func TestJSONStrNoHTMLEscape(t *testing.T) {
 	}
 	if v["screen"] != "<html> a & b" {
 		t.Fatalf("round-trip mismatch: %v", v["screen"])
+	}
+}
+
+func TestHTTPRequest(t *testing.T) {
+	dlDir := t.TempDir()
+	t.Setenv("HOPSKIP_DOWNLOAD_DIR", dlDir)
+	st, err := store.Open(t.TempDir() + "/t.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	d := NewDispatcher(nil, st, http.DefaultClient, nil)
+
+	var gotMethod, gotBody, gotAuth, gotCT string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotAuth = r.Header.Get("Authorization")
+		gotCT = r.Header.Get("Content-Type")
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		switch r.URL.Path {
+		case "/api":
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Server", "hopskip-test")
+			_, _ = w.Write([]byte(`{"ok":true,"echo":"` + gotBody + `"}`))
+		case "/bin":
+			w.Header().Set("Content-Type", "application/octet-stream")
+			_, _ = w.Write([]byte{0, 1, 2, 3, 255, 254})
+		case "/boom":
+			w.WriteHeader(503)
+			_, _ = w.Write([]byte("nope"))
+		}
+	}))
+	defer srv.Close()
+	parse := func(out string) map[string]any {
+		var m map[string]any
+		_ = json.Unmarshal([]byte(out), &m)
+		return m
+	}
+
+	// POST with headers + body: server sees them; response body + headers returned inline
+	out, isErr := d.Dispatch("http_request", json.RawMessage(`{"url":"`+srv.URL+`/api","method":"post","headers":{"Authorization":"Bearer SEKRET","Content-Type":"application/json"},"body":"{\"q\":1}"}`))
+	if isErr {
+		t.Fatalf("http_request errored: %s", out)
+	}
+	if gotMethod != "POST" || gotAuth != "Bearer SEKRET" || gotCT != "application/json" || gotBody != `{"q":1}` {
+		t.Fatalf("server did not receive method/headers/body: method=%s auth=%s ct=%s body=%s", gotMethod, gotAuth, gotCT, gotBody)
+	}
+	res := parse(out)
+	if status, _ := res["status"].(float64); status != 200 {
+		t.Fatalf("expected status 200, got %v", res["status"])
+	}
+	if b, _ := res["body"].(string); !strings.Contains(b, `"ok":true`) {
+		t.Fatalf("expected inline JSON body, got: %s", out)
+	}
+	if hdrs, _ := res["headers"].(map[string]any); hdrs["X-Server"] != "hopskip-test" {
+		t.Fatalf("expected response headers surfaced, got: %v", res["headers"])
+	}
+	// the request's auth header must NOT be echoed back into the result
+	if strings.Contains(out, "SEKRET") {
+		t.Fatalf("request auth header leaked into the tool result: %s", out)
+	}
+
+	// binary response → saved to disk, not inlined
+	out, _ = d.Dispatch("http_request", json.RawMessage(`{"url":"`+srv.URL+`/bin"}`))
+	res = parse(out)
+	if res["body"] != nil {
+		t.Fatalf("binary body should not be inlined: %s", out)
+	}
+	if p, _ := res["path"].(string); !strings.HasPrefix(p, dlDir) {
+		t.Fatalf("binary body should be saved under the download dir: %s", out)
+	}
+
+	// a 5xx is reported as an error result but still returns the body/status
+	out, isErr = d.Dispatch("http_request", json.RawMessage(`{"url":"`+srv.URL+`/boom"}`))
+	res = parse(out)
+	if !isErr || res["status"].(float64) != 503 {
+		t.Fatalf("expected an error result with status 503, got isErr=%v out=%s", isErr, out)
+	}
+
+	// non-http scheme rejected
+	if _, isErr := d.Dispatch("http_request", json.RawMessage(`{"url":"ftp://x"}`)); !isErr {
+		t.Fatal("non-http url should be rejected")
 	}
 }
 
